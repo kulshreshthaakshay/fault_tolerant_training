@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+venv-linux/
+.env
+*.pyc
+
+# Checkpoints and logs
+checkpoints/
+logs/
+*.log
+metrics.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.docker/
+
+# Prometheus
+prometheus/
+
+# Virtual Environment
+venv/
+venv-linux/
+env/
+.env/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
