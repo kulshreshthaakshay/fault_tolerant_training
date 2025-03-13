@@ -3,11 +3,11 @@ The goal of this project was to train BERT-base-uncased on the IMDB dataset in a
 Training large language models (LLMs) like BERT at scale presents several challenges, including hardware failures, unstable gradients, and inefficient resource utilization. To address these issues, I built a fault-tolerant, checkpoint-optimized, and anomaly-detection enabled distributed training system for LLMs. This setup ensures efficient, scalable, and robust training across multiple GPUs while minimizing potential disruptions.
 
 ## Features
-✅ Distributed Training using PyTorch DDP with NCCL backend.
-✅ Fault Tolerance with automatic checkpointing and recovery.
-✅ Anomaly Detection to catch NaNs and unstable gradients.
-✅ Performance Optimizations using AMP, gradient accumulation, and delayed gradient synchronization.
-✅ Monitoring & Logging via Prometheus and structured logging.
+- Distributed Training using PyTorch DDP with NCCL backend.
+- Fault Tolerance with automatic checkpointing and recovery.
+- Anomaly Detection to catch NaNs and unstable gradients.
+- Performance Optimizations using AMP, gradient accumulation, and delayed gradient synchronization.
+- Monitoring & Logging via Prometheus and structured logging.
 
 ## Installation
 ```bash
