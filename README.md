@@ -1,12 +1,13 @@
-# Fault Tolerant Training
-
-A distributed training framework with fault tolerance capabilities for transformer models.
+# Distributed Training System For LLM Dataset w/ Fault-Tolerant Enabled
+The goal of this project was to train BERT-base-uncased on the IMDB dataset in a distributed multi-GPU setting while handling failures gracefully and optimizing performance.
+Training large language models (LLMs) like BERT at scale presents several challenges, including hardware failures, unstable gradients, and inefficient resource utilization. To address these issues, I built a fault-tolerant, checkpoint-optimized, and anomaly-detection enabled distributed training system for LLMs. This setup ensures efficient, scalable, and robust training across multiple GPUs while minimizing potential disruptions.
 
 ## Features
-- Distributed training using PyTorch DDP
-- Fault tolerance with checkpoint management
-- Training monitoring with Prometheus
-- Support for BERT-based models
+✅ Distributed Training using PyTorch DDP with NCCL backend.
+✅ Fault Tolerance with automatic checkpointing and recovery.
+✅ Anomaly Detection to catch NaNs and unstable gradients.
+✅ Performance Optimizations using AMP, gradient accumulation, and delayed gradient synchronization.
+✅ Monitoring & Logging via Prometheus and structured logging.
 
 ## Installation
 ```bash
@@ -30,11 +31,4 @@ torchrun --nproc_per_node=2 src/train.py
   - `models/`: Model architecture definitions
   - `utils/`: Utility functions and classes
   - `train.py`: Main training script
-- `config/`: Configuration files
 - `requirements.txt`: Project dependencies
-
-## Configuration
-Update `config/config.yaml` to modify:
-- Model parameters
-- Training settings
-- Data configurations
