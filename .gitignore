@@ -48,3 +48,25 @@ Thumbs.db
 # Jupyter Notebooks
 .ipynb_checkpoints/
 *.ipynb
+
+# Visual Studio
+.vs/
+*.vsidx
+*.wsuo
+*.sqlite
+DocumentLayout.json
+ProjectSettings.json
+VSWorkspaceState.json
+
+# Installation files
+*.deb
+kubectl
+minikube-linux-amd64
+
+# Test and verification files
+verifying_installation.py
+gpu_test.py
+
+# Kubernetes and Docker
+*.yaml
+!config/config.yaml
