@@ -150,18 +150,41 @@ def train_distributed(model, train_loader, criterion, optimizer, device, epoch,
 def load_checkpoint(model, optimizer, checkpoint_dir='checkpoints'):
     import glob
     import os
-    checkpoints = glob.glob(os.path.join(checkpoint_dir, 'model_epoch_*.pth'))
-    if not checkpoints:
+    
+    load_data = None
+    
+    # 1. Rank 0 searches and loads the checkpoint from the local disk
+    if dist.get_rank() == 0:
+        checkpoints = glob.glob(os.path.join(checkpoint_dir, 'model_epoch_*.pth'))
+        if checkpoints:
+            latest_checkpoint = max(checkpoints, key=lambda path: (
+                int(os.path.basename(path).split('_')[2]), 
+                int(os.path.basename(path).split('_')[4].split('.')[0])
+            ))
+            checkpoint = torch.load(latest_checkpoint, map_location='cpu')
+            load_data = {
+                'checkpoint': checkpoint,
+                'path': latest_checkpoint
+            }
+
+    # 2. Broadcast the loaded data to all ranks
+    obj_list = [load_data]
+    dist.broadcast_object_list(obj_list, src=0)
+    load_data = obj_list[0]
+
+    if load_data is None:
         return 0, 0  # No checkpoint found, start from epoch 0 and batch 0
-    # Get the checkpoint with the highest epoch and batch number
-    latest_checkpoint = max(checkpoints, key=lambda path: (
-        int(os.path.basename(path).split('_')[2]), 
-        int(os.path.basename(path).split('_')[4].split('.')[0])
-    ))
-    checkpoint = torch.load(latest_checkpoint, map_location='cpu')
+        
+    checkpoint = load_data['checkpoint']
+    latest_checkpoint = load_data['path']
+
+    # 3. All ranks uniformly apply the state dictionaries
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    logger.info(f"Loaded checkpoint '{latest_checkpoint}' (epoch {checkpoint['epoch']}, batch {checkpoint['batch_idx']})")
+    
+    if dist.get_rank() == 0:
+        logger.info(f"Loaded checkpoint '{latest_checkpoint}' (epoch {checkpoint['epoch']}, batch {checkpoint['batch_idx']})")
+        
     return checkpoint['epoch'], checkpoint['batch_idx']
 
 def create_optimized_dataloader(dataset, batch_size, world_size, rank):
