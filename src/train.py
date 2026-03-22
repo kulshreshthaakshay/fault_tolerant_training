@@ -23,7 +23,7 @@ GPU_MEMORY_USAGE = Gauge('gpu_memory_bytes', 'GPU memory usage in bytes')
 GRADIENT_NORM = Gauge('gradient_norm', 'Gradient norm')
 
 
-def save_checkpoint_atomic(model, optimizer, epoch, batch_idx, loss, checkpoint_dir='checkpoints'):
+def save_checkpoint_atomic(model, optimizer, epoch, batch_idx, loss, checkpoint_dir='checkpoints', scheduler=None):
     import tempfile
     import time
     import os
@@ -38,6 +38,7 @@ def save_checkpoint_atomic(model, optimizer, epoch, batch_idx, loss, checkpoint_
         'batch_idx': batch_idx,
         'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
         'loss': loss,
         'world_size': dist.get_world_size(),
         'timestamp': time.time()
@@ -132,7 +133,7 @@ def train_distributed(model, train_loader, criterion, optimizer, device, epoch,
                     scheduler.step()
             if batch_idx % checkpoint_interval == 0:
                 dist.barrier()
-                save_checkpoint_atomic(model, optimizer, epoch, batch_idx, loss.item())
+                save_checkpoint_atomic(model, optimizer, epoch, batch_idx, loss.item(), scheduler=scheduler)
             if batch_idx % 100 == 0 and dist.get_rank() == 0:
                 logger.info(f'Epoch {epoch}, Batch {batch_idx}: Loss {loss.item() * gradient_accumulation_steps:.6f}, Grad Norm {grad_norm:.4f}')
     except RuntimeError as e:
@@ -173,7 +174,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir='checkpoints'):
     load_data = obj_list[0]
 
     if load_data is None:
-        return 0, 0  # No checkpoint found, start from epoch 0 and batch 0
+        return 0, 0, None  # No checkpoint found, start from epoch 0 and batch 0
         
     checkpoint = load_data['checkpoint']
     latest_checkpoint = load_data['path']
@@ -185,7 +186,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir='checkpoints'):
     if dist.get_rank() == 0:
         logger.info(f"Loaded checkpoint '{latest_checkpoint}' (epoch {checkpoint['epoch']}, batch {checkpoint['batch_idx']})")
         
-    return checkpoint['epoch'], checkpoint['batch_idx']
+    return checkpoint['epoch'], checkpoint['batch_idx'], checkpoint.get('scheduler_state_dict')
 
 def create_optimized_dataloader(dataset, batch_size, world_size, rank):
     """Create optimized DataLoader for distributed training"""
@@ -245,7 +246,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     
     # Load checkpoint BEFORE DDP wrapping (all ranks load)
-    start_epoch, start_batch = load_checkpoint(model, optimizer)
+    start_epoch, start_batch, loaded_scheduler_state = load_checkpoint(model, optimizer)
     
     # Broadcast epoch/batch from rank 0 to ensure all ranks are synchronized
     resume_info = torch.tensor([start_epoch, start_batch], dtype=torch.long, device=device)
@@ -272,6 +273,9 @@ def main():
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
+    if loaded_scheduler_state is not None:
+        scheduler.load_state_dict(loaded_scheduler_state)
+        logger.info("Restored learning rate scheduler state from checkpoint")
     
     # Start Prometheus metrics server (after all init is complete)
     if local_rank == 0:
@@ -289,7 +293,7 @@ def main():
             scheduler=scheduler
         )
         if local_rank == 0:
-            save_checkpoint_atomic(model, optimizer, epoch+1, 0, avg_loss)
+            save_checkpoint_atomic(model, optimizer, epoch+1, 0, avg_loss, scheduler=scheduler)
 
     # Clean up
     dist.destroy_process_group()
