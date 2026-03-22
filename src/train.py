@@ -211,6 +211,14 @@ def create_optimized_dataloader(dataset, batch_size, world_size, rank):
     return train_loader
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Fault-Tolerant Distributed Training")
+    parser.add_argument("--batch_size", type=int, default=16, help="Per-GPU batch size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
+    args = parser.parse_args()
+
     # Initialize the distributed environment
     dist.init_process_group(backend='nccl')
     
@@ -234,7 +242,7 @@ def main():
     model = TransformerModel(model_name=model_name, num_classes=num_classes).to(device)
     
     # Use AdamW optimizer with weight decay
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     
     # Load checkpoint BEFORE DDP wrapping (all ranks load)
     start_epoch, start_batch = load_checkpoint(model, optimizer)
@@ -254,14 +262,12 @@ def main():
     labels = dataset['train']['label']
     
     # Create data loader
-    batch_size = 16  # Per GPU
-    gradient_accumulation_steps = 4  # Effective batch size = 16 * 4 * world_size
     dataset = TextDataset(texts, labels, model_name=model_name)
-    train_loader = create_optimized_dataloader(dataset, batch_size, world_size, local_rank)
+    train_loader = create_optimized_dataloader(dataset, args.batch_size, world_size, local_rank)
     
     # Create LR scheduler with linear warmup and decay
-    num_epochs = 3
-    total_steps = (len(train_loader) * num_epochs) // gradient_accumulation_steps
+    num_epochs = args.num_epochs
+    total_steps = (len(train_loader) * num_epochs) // args.gradient_accumulation_steps
     warmup_steps = int(0.1 * total_steps)  # 10% warmup
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
@@ -279,7 +285,7 @@ def main():
         logger.info(f'Epoch {epoch+1}/{num_epochs}')
         avg_loss = train_distributed(
             model, train_loader, criterion, optimizer, device, epoch+1,
-            checkpoint_interval=100, gradient_accumulation_steps=gradient_accumulation_steps,
+            checkpoint_interval=100, gradient_accumulation_steps=args.gradient_accumulation_steps,
             scheduler=scheduler
         )
         if local_rank == 0:
