@@ -25,15 +25,15 @@ class TransformerModel(nn.Module):
             attention_mask=attention_mask,
             return_dict=True
         )
-        # Use pooler output or mean pooling
+        # Use pooler output (already Linear+Tanh in BERT) or mean pooling with custom pooler
         if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
             pooled_output = outputs.pooler_output
         else:
-            # Mean pooling with attention mask
+            # Mean pooling with attention mask + custom pooler for non-BERT models
             hidden_states = outputs.last_hidden_state
             attention_mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
             pooled_output = torch.sum(hidden_states * attention_mask_expanded, 1) / torch.clamp(attention_mask_expanded.sum(1), min=1e-9)
-        pooled_output = self.pooler(pooled_output)
+            pooled_output = self.pooler(pooled_output)
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
         return logits

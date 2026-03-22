@@ -25,16 +25,22 @@ class DistributedLogger:
         )
         file_handler.setFormatter(file_formatter)
         self.logger.addHandler(file_handler)
+        # Setup metrics logger properly
+        self.metrics_logger = logging.getLogger(f"{name}_metrics_rank_{self.rank}")
+        self.metrics_logger.setLevel(logging.INFO)
+        self.metrics_logger.propagate = False
+        
         metrics_handler = logging.FileHandler(f'{log_dir}/metrics_rank_{self.rank}.json')
-        self.logger.addHandler(metrics_handler)
+        metrics_handler.setLevel(logging.INFO)
+        self.metrics_logger.addHandler(metrics_handler)
+        
     def log_metrics(self, metrics_dict):
         metrics_dict.update({
             'timestamp': datetime.now().isoformat(),
             'rank': self.rank,
             'world_size': self.world_size
         })
-        metrics_logger = logging.getLogger(f"{self.name}_metrics")
-        metrics_logger.info(json.dumps(metrics_dict))
+        self.metrics_logger.info(json.dumps(metrics_dict))
     def info(self, message):
         self.logger.info(f"[Rank {self.rank}] {message}")
     def warning(self, message):

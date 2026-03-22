@@ -9,8 +9,11 @@ from models.model import TransformerModel
 from utils.data_loader import TextDataset
 from utils.logger import DistributedLogger
 from datasets import load_dataset
+from transformers import get_linear_schedule_with_warmup
+import shutil
+import contextlib
 
-logger = DistributedLogger('train')
+logger = None
 
 # Create a metric to track training time
 TRAINING_TIME = Summary('training_time_seconds', 'Time spent training')
@@ -19,24 +22,13 @@ LOSS_HISTOGRAM = Histogram('training_loss_distribution', 'Distribution of traini
 GPU_MEMORY_USAGE = Gauge('gpu_memory_bytes', 'GPU memory usage in bytes')
 GRADIENT_NORM = Gauge('gradient_norm', 'Gradient norm')
 
-def save_checkpoint(model, optimizer, epoch, batch_idx, loss, checkpoint_dir='checkpoints'):
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-    checkpoint_path = os.path.join(checkpoint_dir, f'model_epoch_{epoch}_batch_{batch_idx}.pth')
-    torch.save({
-        'epoch': epoch,
-        'batch_idx': batch_idx,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss
-    }, checkpoint_path)
-    logger.info(f'Checkpoint saved: {checkpoint_path}')
 
 def save_checkpoint_atomic(model, optimizer, epoch, batch_idx, loss, checkpoint_dir='checkpoints'):
     import tempfile
     import time
     import os
     import torch
+    import shutil
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir, exist_ok=True)
     if dist.get_rank() != 0:
@@ -60,7 +52,7 @@ def save_checkpoint_atomic(model, optimizer, epoch, batch_idx, loss, checkpoint_
         except Exception as e:
             os.unlink(tmp_file.name)
             raise RuntimeError(f"Checkpoint validation failed: {e}")
-        os.rename(tmp_file.name, checkpoint_path)
+        shutil.move(tmp_file.name, checkpoint_path)
     cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
     logger.info(f'Checkpoint saved atomically: {checkpoint_path}')
 
@@ -74,7 +66,9 @@ def cleanup_old_checkpoints(checkpoint_dir, keep_last=3):
             logger.warning(f'Failed to remove old checkpoint {ckpt}: {e}')
 
 @TRAINING_TIME.time()
-def train_distributed(model, train_loader, criterion, optimizer, device, epoch, checkpoint_interval=100):
+def train_distributed(model, train_loader, criterion, optimizer, device, epoch,
+                      checkpoint_interval=100, debug=False,
+                      gradient_accumulation_steps=1, scheduler=None):
     class TrainingAnomalyHandler:
         def __init__(self, max_anomalies=10, recovery_strategies=None):
             self.max_anomalies = max_anomalies
@@ -95,43 +89,52 @@ def train_distributed(model, train_loader, criterion, optimizer, device, epoch, 
     model.train()
     running_loss = 0.0
     anomaly_count = 0
+    grad_norm = 0.0
     dist.barrier()
     anomaly_handler = TrainingAnomalyHandler()
     scaler = torch.cuda.amp.GradScaler()
+    optimizer.zero_grad()
     try:
         for batch_idx, batch in enumerate(train_loader):
             input_ids = batch['input_ids'].to(device, non_blocking=True)
             attention_mask = batch['attention_mask'].to(device, non_blocking=True)
             labels = batch['labels'].to(device, non_blocking=True)
-            optimizer.zero_grad()
+            anomaly_ctx = torch.autograd.detect_anomaly() if debug else contextlib.nullcontext()
             with torch.cuda.amp.autocast():
-                with torch.autograd.detect_anomaly():
+                with anomaly_ctx:
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                     loss = criterion(outputs, labels)
             if torch.isnan(loss) or torch.isinf(loss):
                 logger.error(f"Invalid loss detected: {loss}")
                 anomaly_handler.handle_anomaly('nan_loss', model, optimizer, epoch, batch_idx)
                 continue
+            # Scale loss for gradient accumulation
+            loss = loss / gradient_accumulation_steps
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             # Enhanced Prometheus metrics
             BATCH_PROCESSED.inc()
-            LOSS_HISTOGRAM.observe(loss.item())
+            LOSS_HISTOGRAM.observe(loss.item() * gradient_accumulation_steps)
             GPU_MEMORY_USAGE.set(torch.cuda.memory_allocated())
-            GRADIENT_NORM.set(grad_norm)
-            if grad_norm > 10.0:
-                logger.warning(f"Large gradient norm detected: {grad_norm}")
-                anomaly_handler.handle_anomaly('gradient_explosion', model, optimizer, epoch, batch_idx)
-                anomaly_count += 1
-            scaler.step(optimizer)
-            scaler.update()
-            running_loss += loss.item()
+            running_loss += loss.item() * gradient_accumulation_steps
+            # Only step optimizer every N accumulation steps
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                GRADIENT_NORM.set(grad_norm)
+                if grad_norm > 10.0:
+                    logger.warning(f"Large gradient norm detected: {grad_norm}")
+                    anomaly_handler.handle_anomaly('gradient_explosion', model, optimizer, epoch, batch_idx)
+                    anomaly_count += 1
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                if scheduler is not None:
+                    scheduler.step()
             if batch_idx % checkpoint_interval == 0:
                 dist.barrier()
                 save_checkpoint_atomic(model, optimizer, epoch, batch_idx, loss.item())
             if batch_idx % 100 == 0 and dist.get_rank() == 0:
-                logger.info(f'Epoch {epoch}, Batch {batch_idx}: Loss {loss.item():.6f}, Grad Norm {grad_norm:.4f}')
+                logger.info(f'Epoch {epoch}, Batch {batch_idx}: Loss {loss.item() * gradient_accumulation_steps:.6f}, Grad Norm {grad_norm:.4f}')
     except RuntimeError as e:
         logger.error(f'Training error: {e}')
         dist.barrier()
@@ -146,11 +149,15 @@ def train_distributed(model, train_loader, criterion, optimizer, device, epoch, 
 
 def load_checkpoint(model, optimizer, checkpoint_dir='checkpoints'):
     import glob
+    import os
     checkpoints = glob.glob(os.path.join(checkpoint_dir, 'model_epoch_*.pth'))
     if not checkpoints:
         return 0, 0  # No checkpoint found, start from epoch 0 and batch 0
     # Get the checkpoint with the highest epoch and batch number
-    latest_checkpoint = max(checkpoints, key=lambda path: (int(path.split('_')[2]), int(path.split('_')[4].split('.')[0])))
+    latest_checkpoint = max(checkpoints, key=lambda path: (
+        int(os.path.basename(path).split('_')[2]), 
+        int(os.path.basename(path).split('_')[4].split('.')[0])
+    ))
     checkpoint = torch.load(latest_checkpoint, map_location='cpu')
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -183,6 +190,9 @@ def create_optimized_dataloader(dataset, batch_size, world_size, rank):
 def main():
     # Initialize the distributed environment
     dist.init_process_group(backend='nccl')
+    
+    global logger
+    logger = DistributedLogger('train')
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = dist.get_world_size()
     logger.info(f"Initializing process {local_rank}/{world_size-1}")
@@ -191,10 +201,6 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device('cuda', local_rank)
 
-    # Start Prometheus metrics server
-    if local_rank == 0:
-        start_http_server(8000)
-    
     logger.info(f'Using device: {device}')
     
     # Model parameters
@@ -203,14 +209,21 @@ def main():
     
     # Create model
     model = TransformerModel(model_name=model_name, num_classes=num_classes).to(device)
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-    criterion = nn.CrossEntropyLoss()
     
     # Use AdamW optimizer with weight decay
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
     
-    # Try to load an existing checkpoint
-    start_epoch, start_batch = load_checkpoint(model, optimizer) if local_rank == 0 else (0, 0)
+    # Load checkpoint BEFORE DDP wrapping (all ranks load)
+    start_epoch, start_batch = load_checkpoint(model, optimizer)
+    
+    # Broadcast epoch/batch from rank 0 to ensure all ranks are synchronized
+    resume_info = torch.tensor([start_epoch, start_batch], dtype=torch.long, device=device)
+    dist.broadcast(resume_info, src=0)
+    start_epoch, start_batch = resume_info[0].item(), resume_info[1].item()
+    
+    # Wrap model in DDP after checkpoint loading
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    criterion = nn.CrossEntropyLoss()
 
     # Load IMDb dataset
     dataset = load_dataset('imdb')
@@ -223,13 +236,31 @@ def main():
     dataset = TextDataset(texts, labels, model_name=model_name)
     train_loader = create_optimized_dataloader(dataset, batch_size, world_size, local_rank)
     
-    # Training
+    # Create LR scheduler with linear warmup and decay
     num_epochs = 3
+    total_steps = (len(train_loader) * num_epochs) // gradient_accumulation_steps
+    warmup_steps = int(0.1 * total_steps)  # 10% warmup
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    )
+    
+    # Start Prometheus metrics server (after all init is complete)
+    if local_rank == 0:
+        try:
+            start_http_server(8000)
+        except OSError:
+            logger.warning('Prometheus port 8000 already in use, metrics server not started')
+    
+    # Training
     for epoch in range(start_epoch, num_epochs):
         logger.info(f'Epoch {epoch+1}/{num_epochs}')
-        avg_loss = train_distributed(model, train_loader, criterion, optimizer, device, epoch+1, checkpoint_interval=100)
+        avg_loss = train_distributed(
+            model, train_loader, criterion, optimizer, device, epoch+1,
+            checkpoint_interval=100, gradient_accumulation_steps=gradient_accumulation_steps,
+            scheduler=scheduler
+        )
         if local_rank == 0:
-            save_checkpoint(model, optimizer, epoch+1, 0, avg_loss)
+            save_checkpoint_atomic(model, optimizer, epoch+1, 0, avg_loss)
 
     # Clean up
     dist.destroy_process_group()

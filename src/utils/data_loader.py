@@ -3,10 +3,14 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 from utils.logger import DistributedLogger
 
-logger = DistributedLogger('data_loader')
+logger = None
 
 class TextDataset(Dataset):
     def __init__(self, texts, labels, model_name='bert-base-uncased', max_length=512):
+        global logger
+        if logger is None:
+            logger = DistributedLogger('data_loader')
+            
         self.labels = labels
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
